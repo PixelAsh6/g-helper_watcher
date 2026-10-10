@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+
+# Debug symbols
+*.pdb
+
+# Windows cruft
+Thumbs.db
+Desktop.ini
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Local environment
+.env
