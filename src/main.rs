@@ -53,7 +53,9 @@ const BUILD_ID: &str = env!("BUILD_ID");
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::GetLastError;
-use windows::Win32::Foundation::{BOOL, ERROR_ALREADY_EXISTS, FALSE, HANDLE, HWND};
+use windows::Win32::Foundation::{BOOL, ERROR_ALREADY_EXISTS, FALSE, HANDLE, HWND, LPARAM, SYSTEMTIME, TRUE};
+use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::Security::{
     CheckTokenMembership, CreateWellKnownSid, WinBuiltinAdministratorsSid, PSID,
 };
@@ -68,9 +70,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, FindWindowW, GetForegroundWindow, IsIconic, IsWindowVisible,
-    MsgWaitForMultipleObjects, PeekMessageW, SetForegroundWindow, ShowWindow, TranslateMessage,
-    MSG, PM_REMOVE, QS_ALLINPUT, SW_HIDE, SW_NORMAL, SW_RESTORE, SW_SHOW, WM_QUIT,
+    DispatchMessageW, EnumWindows, FindWindowW, GetForegroundWindow, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, MsgWaitForMultipleObjects, PeekMessageW,
+    SetForegroundWindow, ShowWindow, TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT, SW_HIDE,
+    SW_NORMAL, SW_RESTORE, SW_SHOW, WM_QUIT,
 };
 
 /// 0 = no console (boot/double-click: fully silent), 1 = inherited parent
@@ -83,6 +86,18 @@ fn init_console() {
         if AttachConsole(ATTACH_PARENT_PROCESS).is_ok() {
             CONSOLE.store(1, Ordering::SeqCst);
         }
+    }
+}
+
+/// Local timestamp for the debug log: DD-MM-YYYY:HH-MM-SS.
+fn stamp() -> String {
+    // SAFETY: plain system query into a local.
+    unsafe {
+        let st: SYSTEMTIME = GetLocalTime();
+        format!(
+            "{:02}-{:02}-{:04}:{:02}-{:02}-{:02}",
+            st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute, st.wSecond
+        )
     }
 }
 
@@ -105,13 +120,18 @@ fn log_file(line: &str) {
         .open(&path)
     {
         use std::io::Write as _;
-        let _ = writeln!(f, "{:?} {line}", std::time::SystemTime::now());
+        let _ = writeln!(f, "{} {line}", stamp());
     }
 }
 
 fn error_console(msg: &str) {
     if CONSOLE.load(Ordering::SeqCst) == 1 {
         eprintln!("{msg}");
+        return;
+    }
+    // Boot/autostart launches always carry --minimized: stay file-only and
+    // silent (no console flash, no prompt). Manual runs may pop a console.
+    if std::env::args().any(|a| a == "--minimized") {
         return;
     }
     // SAFETY: AllocConsole is idempotent-safe here (a racing caller just fails).
@@ -154,8 +174,12 @@ pub struct Shared {
     last_switch: Mutex<Option<Instant>>,
     /// Titles hidden by the last tray toggle (unhidden on the next one).
     hidden_windows: Mutex<Vec<String>>,
-    /// Cached `is_startup_enabled` (60s TTL, see `startup_enabled_ttl`).
-    startup_cache: Mutex<(bool, Instant)>,
+    /// Last battery-hold state (transition-only logging, polled every 2s).
+    batt_hold: AtomicBool,
+    /// Last dashboard spawn (debounces double tray presses into one window).
+    last_dash_spawn: Mutex<Instant>,
+    /// Elevation restart requested (watcher thread signals, main thread acts).
+    restart_pending: AtomicBool,
 }
 
 impl Shared {
@@ -253,31 +277,36 @@ pub fn pause_remaining(cfg: &AppConfig) -> Option<Duration> {
 // G-Helper control
 // ---------------------------------------------------------------------------
 
-/// Refresh kinds for every sysinfo scan here: exe (+cmd for the stray
-/// killer) is all anyone reads. `everything()` also walks memory/disk/cwd
-/// per process and was the hottest idle cost.
-fn proc_kinds() -> ProcessRefreshKind {
+/// Hot-path refresh: exe names only, fetched once per PID (a path never
+/// changes for a live process). `cmd` is excluded: reading it doubled the
+/// per-process handle opens on every 2s tick.
+fn exe_kinds() -> ProcessRefreshKind {
+    ProcessRefreshKind::new().with_exe(sysinfo::UpdateKind::OnlyIfNotSet)
+}
+
+/// Full refresh for the rare paths that read command lines (stray-killer).
+fn full_kinds() -> ProcessRefreshKind {
     ProcessRefreshKind::new()
-        .with_exe(sysinfo::UpdateKind::Always)
+        .with_exe(sysinfo::UpdateKind::OnlyIfNotSet)
         .with_cmd(sysinfo::UpdateKind::Always)
 }
 
 /// Run `f` against a thread-local reused `System` instead of building a
 /// fresh `System::new()` per scan (each build re-enumerates everything).
-fn with_system<R>(f: impl FnOnce(&mut System) -> R) -> R {
+fn with_system<R>(kinds: ProcessRefreshKind, f: impl FnOnce(&mut System) -> R) -> R {
     thread_local! {
         static SYS: std::cell::RefCell<System> = std::cell::RefCell::new(System::new());
     }
     SYS.with(|sys| {
         let mut sys = sys.borrow_mut();
-        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_kinds());
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kinds);
         f(&mut sys)
     })
 }
 
 /// Lowercase exe file names of all running processes (sysinfo view).
 fn sysinfo_names() -> Vec<String> {
-    with_system(|sys| {
+    with_system(exe_kinds(), |sys| {
         sys.processes()
             .values()
             .map(|p| {
@@ -321,6 +350,79 @@ pub fn running_exe_names() -> Vec<String> {
     all.sort();
     all.dedup();
     all
+}
+
+/// Visible top-level windows with their owning exe: (title, exe).
+/// Windows share processes (G-Helper's Fans+Power lives inside the single
+/// GHelper.exe), so a process-only picker can never show them.
+pub fn open_windows() -> Vec<(String, String)> {
+    struct Ctx {
+        items: Vec<(String, u32)>,
+    }
+    unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
+        // SAFETY: lp is our Ctx pointer for the duration of this call.
+        unsafe {
+            let ctx = &mut *(lp.0 as *mut Ctx);
+            if !IsWindowVisible(hwnd).as_bool() {
+                return TRUE;
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == 0 {
+                return TRUE;
+            }
+            let mut buf = [0u16; 256];
+            if GetWindowTextW(hwnd, &mut buf) == 0 {
+                return TRUE;
+            }
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            let title = String::from_utf16_lossy(&buf[..end]);
+            if !title.trim().is_empty() {
+                ctx.items.push((title, pid));
+            }
+        }
+        TRUE
+    }
+    let mut ctx = Ctx { items: Vec::new() };
+    // SAFETY: the callback only touches ctx; EnumWindows is synchronous.
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut ctx as *mut Ctx as isize));
+    }
+    with_system(exe_kinds(), |sys| {
+        let mut out = Vec::new();
+        for (title, pid) in &ctx.items {
+            if title == MAIN_TITLE {
+                continue; // our own dashboard, not a watch target
+            }
+            let exe = sys
+                .processes()
+                .get(&sysinfo::Pid::from_u32(*pid))
+                .and_then(|p| p.exe().and_then(|x| x.file_name()))
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if exe.is_empty() {
+                continue;
+            }
+            out.push((title.clone(), exe));
+        }
+        out.sort();
+        out.dedup();
+        out.truncate(200);
+        out
+    })
+}
+
+/// Human-readable boot entry for the dashboard, e.g.
+/// `Task: C:\Apps\GHelper\G-Helper Watcher.exe --minimized`,
+/// `Run: "..." --minimized`, or `Off`.
+pub fn startup_location() -> String {
+    if let Some(exe) = admin_task_exe() {
+        return format!("Task: {exe} --minimized");
+    }
+    if let Some(cmd) = run_key_cmd() {
+        return format!("Run: {cmd}");
+    }
+    "Off".to_string()
 }
 
 /// G-Helper mode index (Modes.GetName: 0=Balanced, 1=Turbo, 2=Silent).
@@ -481,9 +583,47 @@ fn desired_profile(st: &Arc<Shared>) -> (String, usize, bool) {
     (target, count, hit(&sys))
 }
 
+/// True when running on battery power (unknown = false: never hold blindly).
+pub fn on_battery() -> bool {
+    // SAFETY: plain system query into a local.
+    unsafe {
+        let mut st = SYSTEM_POWER_STATUS::default();
+        if GetSystemPowerStatus(&mut st).is_err() {
+            return false;
+        }
+        st.ACLineStatus == 0
+    }
+}
+
+/// Battery hold: with the toggle on and the charger unplugged, revert to
+/// the default profile and skip all further auto-switching until AC
+/// returns. Logs transitions only (evaluated every 2s, never spam).
+fn battery_hold(st: &Arc<Shared>) -> bool {
+    let hold = cfg_snapshot(st).pause_on_battery && on_battery();
+    if hold != st.batt_hold.swap(hold, Ordering::SeqCst) {
+        log_file(if hold {
+            "on battery: reverting to default profile, auto-switch held"
+        } else {
+            "on AC power: auto-switch resumed"
+        });
+    }
+    if hold {
+        // Converge to the default profile while held (the switch cooldown
+        // inside apply_profile still applies; ticks retry until it lands).
+        let cfg = cfg_snapshot(st);
+        if ghelper_running() && st.current_applied() != cfg.default_profile {
+            apply_profile(st, &cfg.default_profile);
+        }
+    }
+    hold
+}
+
 /// Re-evaluate with the full (sysinfo + WMI) picture. No-op while paused.
 pub fn evaluate(st: &Arc<Shared>) {
     if st.is_paused() {
+        return;
+    }
+    if battery_hold(st) {
         return;
     }
     let (target, _count, hit_sys) = desired_profile(st);
@@ -498,6 +638,9 @@ pub fn evaluate(st: &Arc<Shared>) {
 /// sighting — elevated-only apps are invisible here and owned by slow_tick.
 fn fast_tick(st: &Arc<Shared>) {
     if st.is_paused() {
+        return;
+    }
+    if battery_hold(st) {
         return;
     }
     let cfg = cfg_snapshot(st);
@@ -680,7 +823,9 @@ fn reload_cfg(st: &Arc<Shared>) {
     }
     if cfg.restart_request {
         modify_cfg(st, |c| c.restart_request = false);
-        restart_app(st);
+        // Signal the main thread: it drops the tray icon first, so the
+        // restart exit leaves no ghost icon behind.
+        st.restart_pending.store(true, Ordering::SeqCst);
         return;
     }
     converge_admin(st);
@@ -732,15 +877,24 @@ fn own_cfg_thread(st: Arc<Shared>) {
 fn exe_cmdline() -> String {
     match std::env::current_exe() {
         Ok(p) => format!("\"{}\" --minimized", p.to_string_lossy()),
-        Err(_) => "\"ghelper-watcher.exe\" --minimized".to_string(),
+        Err(_) => "\"G-Helper Watcher.exe\" --minimized".to_string(),
     }
 }
 
+/// File name of this binary (lowercased). The exe may be renamed freely
+/// (e.g. `G-Helper Watcher.exe`); never hardcode the file name.
+fn own_exe_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| {
+            p.file_name()
+                .map(|s| s.to_string_lossy().to_lowercase())
+        })
+        .unwrap_or_else(|| "g-helper watcher.exe".to_string())
+}
+
 fn is_autostart() -> bool {
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags(RUN_KEY, KEY_READ)
-        .and_then(|k| k.get_value::<String, _>(REG_NAME))
-        .is_ok()
+    run_key_cmd().is_some()
 }
 
 /// Effective autostart (Run key or elevated logon task).
@@ -748,29 +902,50 @@ pub fn is_startup_enabled() -> bool {
     is_autostart() || admin_task_exists()
 }
 
-/// TTL-cached variant for hot paths (converge runs per config reload).
-/// Refreshes at most every 60s; storage writes below are idempotent
-/// (`/F` overwrite, tolerant delete), so slight staleness is harmless.
-fn startup_enabled_ttl(st: &Arc<Shared>) -> bool {
-    let now = Instant::now();
-    let mut cache = st.startup_cache.lock().unwrap();
-    if now.duration_since(cache.1) > Duration::from_secs(60) {
-        *cache = (is_startup_enabled(), now);
+/// Raw Run-key command, if present. Existence = the user once enabled
+/// standard autostart; the VALUE may still be stale (binary moved).
+fn run_key_cmd() -> Option<String> {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(RUN_KEY, KEY_READ)
+        .and_then(|k| k.get_value::<String, _>(REG_NAME))
+        .ok()
+}
+
+/// True when the Run value exists AND launches this exact binary.
+/// Comparison is case-insensitive: Windows paths and schtasks XML
+/// disagree on case far too often for an exact match.
+fn run_key_valid() -> bool {
+    match run_key_cmd() {
+        Some(v) => same_exe(&v, &exe_cmdline()),
+        None => false,
     }
-    cache.0
+}
+
+/// Case-insensitive exe-command comparison (ignores quoting/case only).
+fn same_exe(a: &str, b: &str) -> bool {
+    let clean = |s: &str| s.trim().trim_matches('"').trim().to_lowercase();
+    clean(a) == clean(b)
 }
 
 /// Set autostart, honoring the run-as-admin preference.
+/// Overwrites unconditionally so a moved/renamed binary heals its own
+/// entries instead of booting a dead path forever. Silent: registry writes
+/// need no elevation; task writes fail standard-side (caller reverts UI).
 pub fn set_startup(on: bool) -> std::io::Result<()> {
     let admin = AppConfig::load().run_as_admin;
     if on {
         if admin {
-            if !admin_task_exists() {
-                set_admin_task(true)?;
-            }
+            // Requires elevation: fails standard-side with access denied
+            // (GUI reverts the checkbox); the next elevated converge heals.
+            set_admin_task(true)?;
             remove_run_key();
         } else {
             set_autostart(true)?;
+            // A stale elevated task would double-launch: best-effort remove
+            // (denied standard-side until the next elevated converge).
+            if admin_task_exists() {
+                let _ = set_admin_task(false);
+            }
         }
     } else {
         remove_run_key();
@@ -859,7 +1034,7 @@ pub struct TrayBundle {
     pub exit_id: MenuId,
 }
 
-fn build_tray() -> TrayBundle {
+fn build_tray() -> anyhow::Result<TrayBundle> {
     let menu = Menu::new();
     let exit_id = MenuId::new("exit");
     let restart_id = MenuId::new("restart");
@@ -867,24 +1042,27 @@ fn build_tray() -> TrayBundle {
     let exit = MenuItem::with_id(exit_id.clone(), "Quit", true, None);
     if !is_elevated() {
         // Already admin: nothing to escalate to, so no item.
-        menu.append(&restart).unwrap();
+        menu.append(&restart)
+            .map_err(|e| anyhow::anyhow!("tray menu append restart: {e:?}"))?;
     }
-    menu.append(&exit).unwrap();
-    let icon = Icon::from_rgba(g_icon_rgba(32), 32, 32).expect("tray icon");
+    menu.append(&exit)
+        .map_err(|e| anyhow::anyhow!("tray menu append exit: {e:?}"))?;
+    let icon = Icon::from_rgba(g_icon_rgba(32), 32, 32)
+        .map_err(|e| anyhow::anyhow!("tray icon: {e:?}"))?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
         .with_tooltip("G-Helper Watcher")
         .with_icon(icon)
         .build()
-        .expect("tray build");
-    TrayBundle {
+        .map_err(|e| anyhow::anyhow!("tray build: {e:?}"))?;
+    Ok(TrayBundle {
         tray,
         restart,
         exit,
         restart_id,
         exit_id,
-    }
+    })
 }
 
 /// Bring one window to the front by exact title. No-op when absent.
@@ -914,18 +1092,38 @@ fn foreground_window() -> Option<HWND> {
     }
 }
 
-/// Bring all open dashboard windows forward (used on unhide/refocus):
-/// show both first (a plain foreground call can leave the second one
-/// behind other apps), then foreground Manage + main so main keeps focus.
-/// Missing windows are skipped, so the single-window case is unchanged.
-fn focus_dashboard() {
-    if let Some(h) = find_window(MANAGE_TITLE) {
-        show_window(h);
+/// Wait until Explorer's taskbar exists (bounded). The daemon (logon task)
+/// routinely starts before the notification area does at boot.
+fn wait_for_shell(timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        // SAFETY: read-only window lookup + state query.
+        let ready = unsafe {
+            match FindWindowW(windows::core::w!("Shell_TrayWnd"), PCWSTR::null()) {
+                Ok(hwnd) if !hwnd.is_invalid() => IsWindowVisible(hwnd).as_bool(),
+                _ => false,
+            }
+        };
+        if ready {
+            // The notify area settles just after the taskbar window appears.
+            std::thread::sleep(Duration::from_secs(2));
+            return;
+        }
+        if start.elapsed() > timeout {
+            log_file("taskbar not found, building tray anyway");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Bring the dashboard window forward (used on unhide/refocus).
+/// Single OS window, single taskbar entry: show first (a plain foreground
+/// call can leave it behind other apps), then take focus.
+fn focus_dashboard() {
     if let Some(h) = find_window(MAIN_TITLE) {
         show_window(h);
     }
-    focus_window(MANAGE_TITLE);
     focus_window(MAIN_TITLE);
 }
 
@@ -933,7 +1131,7 @@ fn focus_dashboard() {
 /// generations that this instance never tracked (e.g. after a taskkill).
 fn kill_stray_dashboards() {
     let me = std::process::id();
-    with_system(|sys| {
+    with_system(full_kinds(), |sys| {
         for (pid, p) in sys.processes() {
         if pid.as_u32() == me {
             continue;
@@ -943,7 +1141,7 @@ fn kill_stray_dashboards() {
             .and_then(|x| x.file_name())
             .map(|s| s.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        if exe != "ghelper-watcher.exe" {
+        if exe != own_exe_name() {
             continue;
         }
         if p.cmd().iter().any(|a| a.to_string_lossy() == "--dashboard") {
@@ -999,7 +1197,6 @@ fn dashboard_pos_near_tray(tray: &TrayBundle) -> Option<(f32, f32)> {
 }
 
 const MAIN_TITLE: &str = "G-Helper Watcher";
-const MANAGE_TITLE: &str = "Manage - G-Helper Watcher";
 
 /// Visible top-level window by exact title (minimized counts as visible).
 fn find_visible(title: &str) -> Option<HWND> {
@@ -1048,53 +1245,57 @@ fn show_window(hwnd: HWND) {
 }
 
 /// Tray-click toggle, G-Helper style:
-/// - nothing open -> open the main window only;
-/// - open but behind other apps -> bring all ours forward;
-/// - ours in front -> hide them (remembered for the next click).
-/// At most one dashboard process ever: strays die on spawn.
+/// - nothing open -> open the main window;
+/// - open but behind other apps -> bring it forward;
+/// - ours in front -> hide it (unhidden on the next click).
+/// Single OS window: at most one dashboard process ever (strays die on
+/// spawn), so the taskbar shows exactly one entry.
 fn toggle_dashboard(st: &Arc<Shared>, tray: &TrayBundle) {
-    let main = find_visible(MAIN_TITLE);
-    let manage = find_visible(MANAGE_TITLE);
-    if main.is_some() || manage.is_some() {
-        let fg = foreground_window();
-        if fg != main && fg != manage {
-            // Open but unfocused: bring everything forward.
+    if let Some(h) = find_visible(MAIN_TITLE) {
+        if foreground_window() == Some(h) {
+            // Ours in front: hide it, remember for the next click.
+            // SAFETY: hiding a looked-up handle.
+            unsafe {
+                let _ = ShowWindow(h, SW_HIDE);
+            }
+            let mut hidden = st.hidden_windows.lock().unwrap();
+            hidden.clear();
+            hidden.push(MAIN_TITLE.to_string());
+            log_file("dashboard hidden by tray toggle");
+        } else {
+            // Open but unfocused: bring it forward.
+            focus_dashboard();
+        }
+        return;
+    }
+    // Nothing visible: unhide the remembered window if it still exists.
+    let hidden: Vec<String> = st.hidden_windows.lock().unwrap().clone();
+    st.hidden_windows.lock().unwrap().clear();
+    if hidden.iter().any(|n| n == MAIN_TITLE) {
+        if find_window(MAIN_TITLE).is_some() {
             focus_dashboard();
             return;
         }
-        // Ours in front: hide everything visible, remember the set.
-        let mut hidden = st.hidden_windows.lock().unwrap();
-        hidden.clear();
-        // SAFETY: hiding looked-up handles.
-        unsafe {
-            for (hdl, name) in [(main, MAIN_TITLE), (manage, MANAGE_TITLE)] {
-                if let Some(h) = hdl {
-                    let _ = ShowWindow(h, SW_HIDE);
-                    hidden.push(name.to_string());
-                }
-            }
+    }
+    // No window at all: drop any windowless zombie, kill strays, spawn.
+    spawn_dashboard(st, tray);
+}
+
+/// Spawn the dashboard child (tray toggle + post-restart reopen share it).
+/// At most one dashboard process ever: strays die here, so duplicates
+/// (e.g. after a rebuild while old windows linger) cannot accumulate.
+/// Double tray presses within 2s collapse into one window: the second
+/// spawn is skipped (the first child is still showing its window).
+fn spawn_dashboard(st: &Arc<Shared>, tray: &TrayBundle) {
+    {
+        let mut t = st.last_dash_spawn.lock().unwrap();
+        if t.elapsed() < Duration::from_secs(2) {
+            log_file("dashboard spawn debounced (double toggle)");
+            focus_dashboard();
+            return;
         }
-        log_file("dashboard hidden by tray toggle");
-        return;
-    }
-    // Nothing visible: unhide the remembered set if it still exists.
-    let hidden: Vec<String> = st.hidden_windows.lock().unwrap().clone();
-    st.hidden_windows.lock().unwrap().clear();
-    let mut restored = false;
-    for name in &hidden {
-        if let Some(h) = find_window(name) {
-            show_window(h);
-            restored = true;
-        }
-    }
-    if restored {
-        focus_dashboard();
-        return;
-    }
-    // No windows at all: drop any windowless zombie, kill strays, spawn.
-    // This is the single place dashboard processes are born, so duplicates
-    // (e.g. after a rebuild while old windows linger) cannot accumulate.
-    let mut slot = st.dashboard_child.lock().unwrap();
+        *t = Instant::now();
+    }    let mut slot = st.dashboard_child.lock().unwrap();
     if let Some(child) = slot.as_mut() {
         if let Ok(None) = child.try_wait() {
             let _ = child.kill();
@@ -1103,7 +1304,7 @@ fn toggle_dashboard(st: &Arc<Shared>, tray: &TrayBundle) {
     }
     drop(slot);
     kill_stray_dashboards();
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ghelper-watcher.exe"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("G-Helper Watcher.exe"));
     let mut cmd = Command::new(exe);
     cmd.arg("--dashboard");
     if let Some((x, y)) = dashboard_pos_near_tray(tray) {
@@ -1253,21 +1454,138 @@ fn set_admin_task(on: bool) -> std::io::Result<()> {
         std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned())
     };
     if on {
+        // XML import carries the battery-proof + immortal settings; fall
+        // back to the legacy /TR form if the import is ever rejected.
         let exe = std::env::current_exe()?;
-        let task_run = format!("\"{}\" --minimized", exe.to_string_lossy());
-        let out = schtasks(&[
-            "/Create", "/TN", TASK_NAME, "/TR", &task_run, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F",
-        ])?;
-        if !out.status.success() {
-            return Err(err(out));
+        let exe_s = exe.to_string_lossy().into_owned();
+        let dir = exe
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match import_task_xml(&task_xml_doc(&exe_s, &dir)) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                log_file(&format!("task XML import failed ({e:?}); trying legacy /TR"));
+                let task_run = format!("\"{exe_s}\" --minimized");
+                let out = schtasks(&[
+                    "/Create", "/TN", TASK_NAME, "/TR", &task_run, "/SC", "ONLOGON", "/RL",
+                    "HIGHEST", "/F",
+                ])?;
+                if out.status.success() {
+                    Ok(())
+                } else {
+                    Err(err(out))
+                }
+            }
         }
     } else if admin_task_exists() {
         let out = schtasks(&["/Delete", "/TN", TASK_NAME, "/F"])?;
         if !out.status.success() {
             return Err(err(out));
         }
+        Ok(())
+    } else {
+        Ok(())
     }
-    Ok(())
+}
+
+/// Raw `schtasks /Query /TN TASK /XML` output, if the task exists.
+/// schtasks emits UTF-16; plain UTF-8 is accepted as fallback.
+fn admin_task_xml() -> Option<String> {
+    let out = schtasks(&["/Query", "/TN", TASK_NAME, "/XML"]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let b = &out.stdout;
+    let text = if b.len() >= 2 && b[0] == 0xFF && b[1] == 0xFE {
+        let u16v: Vec<u16> = b[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&u16v)
+    } else {
+        String::from_utf8_lossy(b).into_owned()
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Exe the logon task points at (parsed from `<Command>`), if any.
+/// Existence = the user once enabled elevated autostart; the VALUE may
+/// still be stale (binary moved) — see `admin_task_valid`.
+fn admin_task_exe() -> Option<String> {
+    let xml = admin_task_xml()?;
+    let open = "<Command>";
+    let close = "</Command>";
+    let start = xml.find(open)? + open.len();
+    let end = xml[start..].find(close)? + start;
+    let cmd = xml[start..end].trim().trim_matches('"').trim().to_string();
+    (!cmd.is_empty()).then_some(cmd)
+}
+
+/// True when the logon task exists AND launches this exact binary.
+fn admin_task_valid() -> bool {
+    match (admin_task_exe(), std::env::current_exe()) {
+        (Some(t), Ok(exe)) => same_exe(&t, &exe.to_string_lossy()),
+        _ => false,
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Logon-task definition: silent elevation at logon (InteractiveToken +
+/// HighestAvailable = zero UAC prompts), battery-proof for laptops
+/// (schtasks defaults refuse to start on battery and kill the daemon when
+/// unplugging), and immortal (defaults kill long-running tasks after 72h).
+/// Command is the bare path (canonical form); arguments stay separate so
+/// spaces in the install dir can never misparse.
+fn task_xml_doc(exe: &str, workdir: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+         <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+         <RegistrationInfo><URI>\\{task}</URI></RegistrationInfo>\n\
+         <Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType>\
+         <RunLevel>HighestAvailable</RunLevel></Principal></Principals>\n\
+         <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\
+         <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\
+         <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\
+         <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\
+         <Enabled>true</Enabled><AllowStartOnDemand>true</AllowStartOnDemand>\
+         <StartWhenAvailable>true</StartWhenAvailable></Settings>\n\
+         <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>\n\
+         <Actions Context=\"Author\"><Exec><Command>{cmd}</Command>\
+         <Arguments>--minimized</Arguments><WorkingDirectory>{dir}</WorkingDirectory>\
+         </Exec></Actions>\n</Task>",
+        task = TASK_NAME,
+        cmd = xml_escape(exe),
+        dir = xml_escape(workdir),
+    )
+}
+
+/// Register the task from an XML document (UTF-16LE with BOM, like the
+/// track schtasks itself exports). Always `/F`: idempotent overwrite.
+fn import_task_xml(xml: &str) -> std::io::Result<()> {
+    let mut path = std::env::temp_dir();
+    path.push("ghelper-watcher-task.xml");
+    let mut bytes = vec![0xFFu8, 0xFE];
+    for u in xml.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes)?;
+    let path_s = path.to_string_lossy().into_owned();
+    let out = schtasks(&["/Create", "/TN", TASK_NAME, "/XML", &path_s, "/F"])?;
+    let _ = std::fs::remove_file(&path);
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    }
 }
 
 fn remove_run_key() {
@@ -1308,27 +1626,50 @@ fn restart_app(st: &Arc<Shared>) {
 /// Sync admin storage to the sticky preference. Never prompts, never
 /// relaunches: elevation changes happen only via explicit Restart
 /// (button/menu) or boot. Called at startup and on config reload.
+/// Storage is self-healing: a moved/renamed binary overwrites its own stale
+/// entries (same silent level, current path) instead of booting dead paths.
 fn converge_admin(st: &Arc<Shared>) {
     let want = cfg_snapshot(st).run_as_admin;
     let have = is_elevated();
+    // Intent is inferred from storage: any leftover (Run key or task) means
+    // the user had autostart ON. Queried fresh every time: a just-deleted
+    // OFF state must never be resurrected by a stale cache.
+    let intent_on = is_startup_enabled();
+    if !intent_on {
+        // Respect OFF: remove leftovers, create nothing. (Previously an
+        // elevated daemon with a standard pref force-created the Run key,
+        // making OFF impossible while elevated.)
+        remove_run_key();
+        if admin_task_exists() {
+            let _ = set_admin_task(false);
+        }
+        return;
+    }
     if want && have {
-        // Approved setup with autostart on: silent elevation via logon task
-        // (no UAC ever again). Without autostart there is nothing to persist
-        // to — a manual launch simply runs at whatever level it got.
-        // TTL-cached: schtasks spawns a process per query and converge runs
-        // on every config reload (including each auto-switch save).
-        if startup_enabled_ttl(st) {
-            if !admin_task_exists() {
-                if let Err(e) = set_admin_task(true) {
-                    log_error!("admin task setup failed: {e:?}");
-                }
-            }
+        // Elevated + admin pref: the task is the single source. Overwrite
+        // only when stale (keeps Last Run info on every game launch);
+        // the overwrite also repairs battery + 72h-limit settings.
+        if admin_task_valid() {
+            remove_run_key();
+        } else if let Err(e) = set_admin_task(true) {
+            log_file(&format!("admin task setup failed: {e:?}"));
+        } else {
             remove_run_key();
         }
-    } else if !want && have {
-        let _ = set_admin_task(false);
-        let _ = set_autostart(true); // preserve autostart at standard level
+    } else if !want {
+        // Standard pref: the Run key is the single source (HKCU needs no
+        // elevation). Overwrite when stale; drop any leftover task.
+        if !run_key_valid() {
+            if let Err(e) = set_autostart(true) {
+                log_file(&format!("autostart repair failed: {e:?}"));
+            }
+        }
+        if admin_task_exists() {
+            let _ = set_admin_task(false);
+        }
     }
+    // want && !have (standard process, admin pref): nothing — escalation
+    // happens only via explicit Restart (button/menu) or boot. Never prompt.
 }
 
 pub(crate) const DASH_W: f32 = 350.0;
@@ -1401,6 +1742,12 @@ fn dashboard_position() -> Option<eframe::egui::Pos2> {
 
 /// Dashboard child process: owns the ONE eframe event loop, born visible.
 fn run_dashboard() -> anyhow::Result<()> {
+    // A visible dashboard already exists (tray double-press raced a second
+    // spawn past the debounce): exit instead of opening a twin window.
+    if find_visible(MAIN_TITLE).is_some() {
+        log_file("second visible dashboard, exiting");
+        std::process::exit(0);
+    }
     // Position from the daemon (--pos, above the tray icon on its monitor),
     // else the work-area fallback.
     let mut pos = dashboard_position();
@@ -1457,6 +1804,10 @@ fn main() -> anyhow::Result<()> {
         return run_dashboard();
     }
     ensure_single_instance();
+    // Mixed-integrity leftovers (e.g. a standard dashboard child surviving
+    // an elevated restart, or vice versa) would run at the wrong level and
+    // confuse every elevation-gated toggle: drop them, tray reopens on demand.
+    kill_stray_dashboards();
     log_file(&format!("daemon starting, elevated={}", is_elevated()));
     // Accepted for Run-key compat; app is ALWAYS tray-first.
     let _ = std::env::args().any(|a| a == "--minimized");
@@ -1472,7 +1823,9 @@ fn main() -> anyhow::Result<()> {
         dashboard_child: Mutex::new(None),
         last_switch: Mutex::new(None),
         hidden_windows: Mutex::new(Vec::new()),
-        startup_cache: Mutex::new((false, Instant::now() - Duration::from_secs(3600))),
+        batt_hold: AtomicBool::new(false),
+        last_dash_spawn: Mutex::new(Instant::now() - Duration::from_secs(3600)),
+        restart_pending: AtomicBool::new(false),
     });
     let fresh = AppConfig::path().map(|p| !p.exists()).unwrap_or(false);
     let _ = st.cfg.lock().unwrap().save(); // persist defaults on first run
@@ -1494,10 +1847,12 @@ fn main() -> anyhow::Result<()> {
     // only real drift (with G-Helper running) triggers one silent switch.
     let current = read_ghelper_mode();
     *st.last_mode.lock().unwrap() = current.clone();
-    // Honor a pending restart request (set just before a crash/exit).
+    // A stale restart request (crash between set and consume) is cleared
+    // without acting: auto-escalating here would UAC-prompt at logon.
+    // The user re-presses the button when they actually want elevation.
     if st.cfg.lock().unwrap().restart_request {
         modify_cfg(&st, |c| c.restart_request = false);
-        restart_app(&st);
+        log_file("stale restart request cleared (no auto-escalation at startup)");
     }
     // A stale "wmi" value from an earlier elevated run would lie to the
     // dashboard; only a live subscription may set it (see wmi_thread).
@@ -1528,15 +1883,54 @@ fn main() -> anyhow::Result<()> {
 
     // Daemon message pump: tray icon lives on this thread. Zero CPU while
     // idle (500ms timeout only pumps tray/window messages).
-    let tray = build_tray();
+    // At logon Explorer's notification area may not exist yet — and a
+    // too-early build can HALF-register, leaving a phantom twin icon next
+    // to the real one. Wait for the taskbar first, then build.
+    wait_for_shell(Duration::from_secs(60));
+    // Retries remain as a backstop (file-only logging, never a console
+    // flash): a panic here is silent death with no tray and no error.
+    let tray = loop {
+        match build_tray() {
+            Ok(t) => break t,
+            Err(e) => {
+                log_file(&format!("tray not ready ({e:?}); retrying"));
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        }
+    };
     log_file("tray ready");
+    // Post-restart reopen: the dashboard the restart was requested from was
+    // killed with the old generation — spawn it back (at the new integrity
+    // level) so the window the user clicked in comes back focused.
+    if st.cfg.lock().unwrap().reopen_dashboard {
+        modify_cfg(&st, |c| c.reopen_dashboard = false);
+        log_file("reopening dashboard after restart");
+        spawn_dashboard(&st, &tray);
+    }
     let mut quit = false;
     loop {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             log_file(&format!("tray menu event: {ev:?}"));
             if ev.id == tray.restart_id {
-                modify_cfg(&st, |c| c.run_as_admin = true);
-                restart_app(&st);
+                // Keep the window: reopen it once the restart lands (the
+                // startup stray-kill would otherwise eat it). The main
+                // thread performs the restart AFTER dropping the tray icon,
+                // so no ghost icon is left behind (process::exit skips Drop).
+                let ui_open = find_visible(MAIN_TITLE).is_some()
+                    || !st.hidden_windows.lock().unwrap().is_empty()
+                    || st
+                        .dashboard_child
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .is_some_and(|c| matches!(c.try_wait(), Ok(None)));
+                modify_cfg(&st, |c| {
+                    c.run_as_admin = true;
+                    if ui_open {
+                        c.reopen_dashboard = true;
+                    }
+                });
+                st.restart_pending.store(true, Ordering::SeqCst);
             } else if ev.id == tray.exit_id {
                 if let Some(mut child) = st.dashboard_child.lock().unwrap().take() {
                     let _ = child.kill();
@@ -1561,6 +1955,9 @@ fn main() -> anyhow::Result<()> {
         if quit {
             break;
         }
+        if st.restart_pending.load(Ordering::SeqCst) {
+            break;
+        }
         unsafe {
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -1572,6 +1969,12 @@ fn main() -> anyhow::Result<()> {
             }
             let _ = MsgWaitForMultipleObjects(Some(&[]), false, 500, QS_ALLINPUT);
         }
+    }
+    // Drop the tray icon BEFORE any restart exit: process::exit skips Drop,
+    // which used to leave one ghost tray icon per elevated restart.
+    drop(tray);
+    if !quit && st.restart_pending.swap(false, Ordering::SeqCst) {
+        restart_app(&st);
     }
     Ok(())
 }

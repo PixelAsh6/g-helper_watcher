@@ -29,33 +29,43 @@ zero-polling process events.
 - **Startup** — `HKCU\...\Run` entry, or (elevated) a logon scheduled task
   with highest privileges so elevation survives reboots with zero UAC prompts.
 
-## Dashboard
+## Dashboard (single window, single taskbar entry)
 
 - **Status card** — live state (Active / Paused countdown with Pause /
-  Resume button), G-Helper mode, watched-running count plus first running
-  app, switch cooldown, event source (WMI-instant vs poll), daemon
-  privilege, Start G-Helper button when G-Helper is missing.
-- **Profiles** — Default and Trigger tiles, with a Settings button.
-- **Manage window** — side window with the tracked-apps list (click a row
-  to stop tracking it), type-to-filter, exact-name entry, `.exe` browser,
-  plus settings: pause duration, switch cooldown, Start with Windows,
-  Run as Administrator. A **restart UAC** button next to the
-  Events row restarts elevated on demand.
+  Resume button, or Paused-on-battery), G-Helper mode, watched-running
+  count plus first running app, switch cooldown, event source
+  (WMI-instant vs poll), daemon privilege, Start G-Helper button when
+  G-Helper is missing.
+- **Profiles** — Default and Trigger tiles, with a Settings button that
+  expands the section below inline (the window grows, then shrinks back).
+- **Watched apps + Settings** — tracked-apps list (click a row to stop
+  tracking it), type-to-filter with running-process and open-window
+  suggestions (windows share one process — e.g. Fans+Power lives inside
+  `GHelper.exe` — so a window row tracks its owning exe; already-listed
+  exes never repeat), click a suggestion to insert it, Enter inserts an
+  exact/unique match, Esc closes the list, exact-name entry, `.exe`
+  browser, plus settings: pause duration, switch cooldown, pause
+  switching on battery, Start with Windows (with the actual boot entry
+  shown underneath), Run as Administrator. Toggle failures explain
+  themselves instead of snapping back. A **restart UAC** button next to
+  the Events row restarts elevated on demand and reopens the window.
 
 ## Resource usage
 
 Working set / private MB and avg CPU (% of one core), release build,
-16-core machine, measured 2026-10-10:
+16-core machine, measured 2026-10-11 (v1.0.1; 60s daemon samples,
+30s settled-dashboard samples):
 
 | Setup | Daemon | Dashboard | Combined |
 |-------|--------|-----------|----------|
-| Standard, daemon only | 20.5 / 7.2 MB · ~2% | — | same |
-| Standard, daemon + dashboard | 21.3 / 8.1 MB · ~2% | 85 / 83 MB · ~1% | ~106 / ~91 MB · ~3% |
-| Elevated, daemon only | 20.2 / 7.3 MB · ~2% | — | same |
-| Elevated, daemon + dashboard | 20.7 / 7.6 MB · ~2% | 85 / 83 MB · ~1% | ~106 / ~91 MB · ~3% |
+| Standard, daemon only | 19.5–20 / 6.1–7 MB · ~1% | — | same |
+| Standard, daemon + dashboard | 20 / 7 MB · ~0.6% | 83.5 / 80.5 MB · ~0.5% | ~104 / ~87 MB · ~1% |
+| Elevated, daemon only | 21.5 / 7.2 MB · ~0.8% | — | same |
+| Elevated, daemon + dashboard | 21.5 / 7.2 MB · ~0.8% | 83 / 81 MB · ~0.5% | ~105 / ~88 MB · ~1.3% |
 
-The daemon ticks every 2s (~2–6% blips); the 15s merged tick spikes to
-~10% once (WMI process query, both modes). The dashboard repaints every
+The daemon ticks every 2s (exe-name scan only, fetched once per PID); the
+30s merged tick (WMI process query, both modes) is only a safety net
+behind the 2s tick and instant WMI events. The dashboard repaints every
 1s while open and costs nothing when closed (separate process, exits on X).
 
 ## Configuration
@@ -69,13 +79,15 @@ The daemon ticks every 2s (~2–6% blips); the 15s merged tick spikes to
   "trigger_profile": "Turbo",
   "pause_minutes": 10,
   "switch_cooldown_secs": 60,
+  "pause_on_battery": false,
   "paused_until_millis": null,
   "event_source": null,
   "run_as_admin": false,
   "daemon_elevated": null,
   "daemon_build": null,
   "last_switch_millis": null,
-  "restart_request": false
+  "restart_request": false,
+  "reopen_dashboard": false
 }
 ```
 
@@ -93,12 +105,32 @@ Append-only debug log: `%AppData%\ghelper-watcher\watcher.log`.
 ## Build
 
 ```powershell
-cargo build --release
+$env:RUSTFLAGS = "-C target-cpu=native"; cargo build --release
 ```
 
-The binary lands at `target\release\ghelper-watcher.exe`. First run enables
+Ship the binary as `G-Helper_Watcher.exe` (any file name works — boot
+entries heal to whatever binary is running). Release profile:
+`opt-level=3`, fat LTO, single codegen unit, `panic=abort`, stripped;
+eframe pinned to the `glow` renderer without accesskit/wayland shims
+(`wgpu` would roughly triple the dashboard's open RAM). First run enables
 autostart automatically; toggle **Run as administrator** once (one UAC
 prompt) for silent elevated autostart afterwards.
+
+## Boot reliability
+
+- **Self-healing entries** — a moved/renamed binary rewrites its own Run
+  key / logon task (same level, current path) instead of booting a dead
+  path. The dashboard shows the actual entry (`Task: …` / `Run: …` / `Off`).
+- **Battery-proof, immortal task** — the logon task starts on battery and
+  has no execution time limit (defaults would skip unplugged logons and
+  kill the daemon after 72h).
+- **Logon-safe tray** — the daemon waits for Explorer's taskbar before
+  registering its icon (no phantom twin), retries instead of panicking,
+  and drops the icon before restart exits (no ghosts).
+- **One instance, silent** — named-mutex single instance, double tray
+  presses collapse into one window, no console flash and no UAC at boot.
+- **Honest limitation** — removing an elevated task needs elevation:
+  press restart UAC (one prompt), then toggle off.
 
 ## License
 

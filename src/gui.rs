@@ -128,7 +128,6 @@ fn mode_tile(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) -> egui
 pub struct DashboardApp {
     cfg: AppConfig,
     filter: String,
-    candidate: Option<String>,
     snap: Vec<String>,
     snap_gen: u64,
     bg: std::sync::Arc<BgState>,
@@ -136,24 +135,31 @@ pub struct DashboardApp {
     last_reload: Instant,
     autostart_at: Instant,
     autostart: bool,
+    startup_desc: String,
+    wins: Vec<(String, String)>,
+    last_toggle_err: Option<String>,
     admin: bool,
     was_focused: bool,
-    popup_pin: bool,
+    popup_open: bool,
+    prev_filter: String,
     show_manage: bool,
-    manage_placed: bool,
+    fitted_manage: bool,
     sized_once: bool,
     content_h: f32,
     sent_h: f32,
     orphan_since: Option<Instant>,
 }
 
-/// Background sampler: sysinfo + WMI + schtasks stay OFF the UI thread.
-/// (A full scan stalls frames and made dragging stutter.)
+/// Background sampler: sysinfo + WMI + schtasks + window list stay OFF the
+/// UI thread. (A full scan stalls frames and made dragging stutter.)
 struct BgState {
     snap: std::sync::Mutex<Vec<String>>,
     snap_gen: std::sync::atomic::AtomicU64,
     want_snap: std::sync::atomic::AtomicBool,
     autostart: std::sync::Mutex<bool>,
+    startup_desc: std::sync::Mutex<String>,
+    wins: std::sync::Mutex<Vec<(String, String)>>,
+    want_refresh: std::sync::atomic::AtomicBool,
 }
 
 impl BgState {
@@ -163,6 +169,9 @@ impl BgState {
             snap_gen: std::sync::atomic::AtomicU64::new(0),
             want_snap: std::sync::atomic::AtomicBool::new(true),
             autostart: std::sync::Mutex::new(false),
+            startup_desc: std::sync::Mutex::new("checking…".to_string()),
+            wins: std::sync::Mutex::new(Vec::new()),
+            want_refresh: std::sync::atomic::AtomicBool::new(true),
         });
         let bg2 = std::sync::Arc::clone(&bg);
         std::thread::spawn(move || {
@@ -172,7 +181,10 @@ impl BgState {
                 let want = bg2
                     .want_snap
                     .swap(false, std::sync::atomic::Ordering::Relaxed);
-                if want || slow.elapsed() > std::time::Duration::from_secs(30) {
+                let refr = bg2
+                    .want_refresh
+                    .swap(false, std::sync::atomic::Ordering::Relaxed);
+                if want || refr || slow.elapsed() > std::time::Duration::from_secs(30) {
                     slow = std::time::Instant::now();
                     let mut names = crate::running_exe_names();
                     names.sort();
@@ -184,6 +196,14 @@ impl BgState {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Ok(mut a) = bg2.autostart.lock() {
                         *a = crate::is_startup_enabled();
+                    }
+                    // schtasks + window enumeration are slowish: same tick,
+                    // never the UI thread.
+                    if let Ok(mut d) = bg2.startup_desc.lock() {
+                        *d = crate::startup_location();
+                    }
+                    if let Ok(mut w) = bg2.wins.lock() {
+                        *w = crate::open_windows();
                     }
                 }
             }
@@ -198,9 +218,11 @@ impl DashboardApp {
         Self {
             admin: cfg.run_as_admin,
             autostart: is_startup_enabled(),
+            startup_desc: "checking…".to_string(),
+            wins: Vec::new(),
+            last_toggle_err: None,
             cfg,
             filter: String::new(),
-            candidate: None,
             snap: Vec::new(),
             snap_gen: 0,
             bg: BgState::spawn(),
@@ -208,9 +230,10 @@ impl DashboardApp {
             last_reload: Instant::now(),
             autostart_at: Instant::now() - Duration::from_secs(99),
             was_focused: false,
-            popup_pin: false,
+            popup_open: false,
+            prev_filter: String::new(),
             show_manage: false,
-            manage_placed: false,
+            fitted_manage: false,
             sized_once: false,
             content_h: 0.0,
             sent_h: 0.0,
@@ -229,6 +252,12 @@ impl DashboardApp {
         }
         if let Ok(a) = self.bg.autostart.try_lock() {
             self.autostart = *a;
+        }
+        if let Ok(d) = self.bg.startup_desc.try_lock() {
+            self.startup_desc = d.clone();
+        }
+        if let Ok(w) = self.bg.wins.try_lock() {
+            self.wins = w.clone();
         }
         self.last_snap = Instant::now();
     }
@@ -271,31 +300,58 @@ impl DashboardApp {
         })
     }
 
-    /// Add the explicit pick, an exact/unique match, or the typed name.
+    /// Add the explicit pick, an exact/unique match, or the typed name
+    /// (Add button: explicit user intent, guessing allowed).
     fn add_current(&mut self) {
-        let pick = self.candidate.clone().or_else(|| {
+        let pick = {
             let q = self.filter.trim().to_lowercase();
             if q.is_empty() {
-                return None;
+                return;
             }
             if let Some(exact) = self.snap.iter().find(|n| *n == &q) {
-                return Some(exact.clone());
-            }
-            let matches = self.matches();
-            if matches.len() == 1 {
-                return matches.into_iter().next();
-            }
-            Self::normalize(&self.filter)
-        });
-        if let Some(p) = pick {
-            self.edit(|c| {
-                if !c.watched.iter().any(|w| w == &p) {
-                    c.watched.push(p);
+                Some(exact.clone())
+            } else {
+                let matches = self.matches();
+                if matches.len() == 1 {
+                    matches.into_iter().next()
+                } else {
+                    Self::normalize(&self.filter)
                 }
-            });
-            self.candidate = None;
-            self.filter.clear();
+            }
+        };
+        if let Some(p) = pick {
+            self.add_exe(p);
         }
+    }
+
+    /// Enter key: only an unambiguous pick (exact or unique match).
+    /// Multiple matches → click one instead; never guess.
+    fn add_on_enter(&mut self) {
+        let q = self.filter.trim().to_lowercase();
+        if q.is_empty() {
+            return;
+        }
+        if let Some(exact) = self.snap.iter().find(|n| *n == &q) {
+            let exact = exact.clone();
+            self.add_exe(exact);
+            return;
+        }
+        if self.matches().len() == 1 {
+            if let Some(m) = self.matches().into_iter().next() {
+                self.add_exe(m);
+            }
+        }
+    }
+
+    /// Insert an exe into the watch list (idempotent), clear the picker.
+    fn add_exe(&mut self, exe: String) {
+        self.edit(|c| {
+            if !c.watched.iter().any(|w| w == &exe) {
+                c.watched.push(exe);
+            }
+        });
+        self.filter.clear();
+        self.popup_open = false;
     }
 
     fn browse_exe(&mut self) {
@@ -343,10 +399,6 @@ impl DashboardApp {
         });
         self.cfg.paused_until_millis = None;
         self.cfg.last_switch_millis = None;
-    }
-
-    fn manage_id() -> egui::ViewportId {
-        egui::ViewportId::from_hash_of("ghelper-manage")
     }
 
     /// Best-effort start of G-Helper when it is not running. Looks in the
@@ -492,7 +544,6 @@ impl DashboardApp {
                         });
                     }
                     ui.add_space(8.0);
-                    let mut popup = false;
                     ui.horizontal(|ui| {
                         let avail = ui.available_width();
                         let resp = ui.add(
@@ -500,10 +551,7 @@ impl DashboardApp {
                                 .hint_text("Filter running apps — or type an exact .exe")
                                 .desired_width((avail - 92.0).max(60.0)),
                         );
-                        if ui.button("Add").clicked()
-                            || (resp.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        {
+                        if ui.button("Add").clicked() {
                             self.add_current();
                         }
                         let focused_now = resp.has_focus();
@@ -513,12 +561,51 @@ impl DashboardApp {
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         self.was_focused = focused_now;
-                        popup = focused_now && !self.filter.trim().is_empty();
+                        // Enter inserts only an unambiguous pick (exact or
+                        // unique); with several matches, click one instead.
+                        // Single-line TextEdit consumes Enter (surrendering
+                        // focus), so detect both the raw key and the submit.
+                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if (focused_now && enter) || (resp.lost_focus() && enter) {
+                            self.add_on_enter();
+                        }
+                        if self.popup_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            self.filter.clear();
+                            self.popup_open = false;
+                        }
                     });
-                    if popup || self.popup_pin {
+                    // Latch the popup open while there's filter text: at the
+                    // idle 1Hz repaint, focus-loss and hover race each other
+                    // and clicks/Enter fall through a closed list.
+                    if self.filter.trim().is_empty() {
+                        self.popup_open = false;
+                    } else if self.filter != self.prev_filter {
+                        self.popup_open = true;
+                    }
+                    self.prev_filter = self.filter.clone();
+                    if self.popup_open && !self.filter.trim().is_empty() {
                         let matches = self.matches();
-                        if !matches.is_empty() {
-                            let fr = egui::Frame::group(ui.style())
+                        // Open windows whose exe isn't watched yet (Fans+Power
+                        // lives inside the single GHelper.exe process, so the
+                        // process list above can never show it). Picking one
+                        // tracks its owning exe. Skipped when the exe is
+                        // already listed above: no duplicate rows.
+                        let shown: std::collections::HashSet<&str> =
+                            matches.iter().map(|s| s.as_str()).collect();
+                        let q = self.filter.trim().to_lowercase();
+                        let win_hits: Vec<(String, String)> = self
+                            .wins
+                            .iter()
+                            .filter(|(t, e)| {
+                                !shown.contains(e.as_str())
+                                    && !self.cfg.watched.iter().any(|w| w.as_str() == e.as_str())
+                                    && (t.to_lowercase().contains(&q) || e.contains(&q))
+                            })
+                            .take(20)
+                            .cloned()
+                            .collect();
+                        if !matches.is_empty() || !win_hits.is_empty() {
+                            let _fr = egui::Frame::group(ui.style())
                                 .fill(CARD)
                                 .stroke(egui::Stroke::new(
                                     1.0_f32,
@@ -531,16 +618,32 @@ impl DashboardApp {
                                         .max_height(150.0)
                                         .show(ui, |ui| {
                                             for m in matches {
-                                                let sel =
-                                                    self.candidate.as_deref() == Some(&m);
-                                                if ui.selectable_label(sel, &m).clicked() {
-                                                    self.filter = m.clone();
-                                                    self.candidate = Some(m);
+                                                // Click inserts immediately.
+                                                if ui.selectable_label(false, &m).clicked() {
+                                                    self.add_exe(m);
+                                                }
+                                            }
+                                            if !win_hits.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new("WINDOWS")
+                                                        .size(11.0)
+                                                        .color(MUTED),
+                                                );
+                                                for (title, exe) in &win_hits {
+                                                    // Click inserts the owning exe immediately.
+                                                    if ui
+                                                        .selectable_label(
+                                                            false,
+                                                            format!("{title}  ({exe})"),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.add_exe(exe.clone());
+                                                    }
                                                 }
                                             }
                                         });
                                 });
-                            self.popup_pin = fr.response.hovered();
                         }
                     }
                     ui.add_space(4.0);
@@ -584,12 +687,44 @@ impl DashboardApp {
                             .color(MUTED),
                     );
                     ui.add_space(4.0);
+                    let mut batt = self.cfg.pause_on_battery;
                     if ui
-                        .checkbox(&mut self.autostart, "Start with Windows")
+                        .checkbox(&mut batt, "Pause switching on battery")
                         .changed()
-                        && set_startup(self.autostart).is_err()
                     {
-                        self.autostart = is_startup_enabled();
+                        self.edit(|c| c.pause_on_battery = batt);
+                    }
+                    if ui.checkbox(&mut self.autostart, "Start with Windows").changed() {
+                        let wanted = self.autostart;
+                        match set_startup(wanted) {
+                            Ok(()) => self.last_toggle_err = None,
+                            Err(e) => {
+                                let actual = is_startup_enabled();
+                                crate::log_file(&format!(
+                                    "start-with-Windows toggle to {wanted} failed ({e}); actual={actual}"
+                                ));
+                                self.autostart = actual;
+                                self.last_toggle_err = if actual != wanted {
+                                    Some(if wanted {
+                                        format!("Couldn't turn ON: {e}")
+                                    } else {
+                                        "Couldn't turn OFF: removing the logon task needs elevation — press restart UAC (one prompt), then uncheck again.".to_string()
+                                    })
+                                } else {
+                                    None
+                                };
+                            }
+                        }
+                        // Write-through: the bg snapshot refreshes at most
+                        // every 30s; without this its stale value snaps the
+                        // checkbox back on the very next frame.
+                        if let Ok(mut a) = self.bg.autostart.lock() {
+                            *a = self.autostart;
+                        }
+                        // Re-read the boot entry location within ~1s.
+                        self.bg
+                            .want_refresh
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     if ui
                         .checkbox(&mut self.admin, "Run as administrator")
@@ -614,22 +749,30 @@ impl DashboardApp {
                         .size(11.0)
                         .color(MUTED),
                     );
+                    ui.label(
+                        egui::RichText::new(format!("Boot entry: {}", self.startup_desc))
+                            .size(11.0)
+                            .color(MUTED)
+                            .monospace(),
+                    );
+                    if let Some(err) = &self.last_toggle_err {
+                        ui.label(egui::RichText::new(err).size(11.0).color(AMBER));
+                    }
                 });
             });
     }
 
-    /// Size to content on first frame, grow-only after (never fights
-    /// manual resizing). Content-driven, so it converges. Also re-docks
-    /// to the work-area bottom-right (just above the taskbar) so the
-    /// window opens like G-Helper instead of floating mid-screen:
-    /// InnerSize alone keeps the top-left anchored, which leaves a gap
-    /// below after shrinking from the initial tall size.
+    /// Size to content on first frame, grow-only after — except across
+    /// Manage toggles, which re-fit both ways (open grows, close shrinks).
+    /// Manual resizes between toggles are never overridden.
     fn fit_window(&mut self, ctx: &egui::Context) {
         let want = (self.content_h + 28.0).clamp(420.0, crate::max_dash_height());
         let cur = ctx.screen_rect().height();
         let grow = want > cur + 2.0;
-        if !self.sized_once || grow {
+        let toggled = self.show_manage != self.fitted_manage;
+        if !self.sized_once || grow || toggled {
             self.sized_once = true;
+            self.fitted_manage = self.show_manage;
             if (self.sent_h - want).abs() > 1.0 {
                 self.sent_h = want;
                 crate::log_file(&format!(
@@ -710,6 +853,7 @@ impl eframe::App for DashboardApp {
         }
 
         let paused = pause_remaining(&self.cfg);
+        let batt_hold = self.cfg.pause_on_battery && crate::on_battery();
         let running_count = self
             .snap
             .iter()
@@ -761,6 +905,15 @@ impl eframe::App for DashboardApp {
                                                 .size(16.0)
                                                 .strong()
                                                 .color(AMBER),
+                                            );
+                                        }
+                                        None if batt_hold => {
+                                            dot(ui, AMBER);
+                                            ui.label(
+                                                egui::RichText::new("Paused · on battery")
+                                                    .size(16.0)
+                                                    .strong()
+                                                    .color(AMBER),
                                             );
                                         }
                                         None => {
@@ -915,6 +1068,7 @@ impl eframe::App for DashboardApp {
                                             self.edit(|c| {
                                                 c.run_as_admin = true;
                                                 c.restart_request = true;
+                                                c.reopen_dashboard = true;
                                             });
                                         }
                                     }
@@ -969,9 +1123,14 @@ impl eframe::App for DashboardApp {
                                         )
                                         .clicked()
                                     {
-                                        self.show_manage = true;
-                                        self.manage_placed = false;
+                                        // Single OS window: Manage renders
+                                        // inline below (one taskbar entry).
+                                        self.show_manage = !self.show_manage;
                                         self.bg.want_snap.store(
+                                            true,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        self.bg.want_refresh.store(
                                             true,
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
@@ -1003,59 +1162,16 @@ impl eframe::App for DashboardApp {
                             }
                         });
                     });
+                    if self.show_manage {
+                        // Single OS window: Manage renders inline below the
+                        // profiles (one taskbar entry; grows to the work
+                        // area, then scrolls).
+                        ui.add_space(12.0);
+                        self.render_manage_inner(ui, admin_live);
+                    }
                     self.content_h = ui.min_rect().height();
                 });
         });
-        // ---- Manage window: separate OS window left of the dashboard ----
-        // (G-Helper style: Fans+Power opens beside the main window, not as
-        // an in-dashboard popup clipping the content.)
-        if self.show_manage {
-            let mid = Self::manage_id();
-            if !self.manage_placed {
-                self.manage_placed = true;
-                // Dock left of the main window, same top edge.
-                if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
-                    let x = (r.min.x - 388.0).max(8.0);
-                    ctx.send_viewport_cmd_to(
-                        mid,
-                        egui::ViewportCommand::OuterPosition(egui::pos2(x, r.min.y)),
-                    );
-                }
-            }
-            let mut close = false;
-            ctx.show_viewport_immediate(
-                mid,
-                egui::ViewportBuilder::default()
-                    .with_title("Manage - G-Helper Watcher")
-                    .with_inner_size([380.0, 560.0])
-                    .with_min_inner_size([340.0, 420.0])
-                    .with_maximize_button(false)
-                    .with_minimize_button(false)
-                    .with_resizable(true),
-                |mctx, class| {
-                    if class == egui::ViewportClass::Embedded {
-                        // Fallback when the backend has no multi-window:
-                        // inline window inside the dashboard.
-                        egui::Window::new(crate::MANAGE_TITLE).show(mctx, |ui| {
-                            self.render_manage_inner(ui, admin_live);
-                        });
-                    } else {
-                        egui::CentralPanel::default().show(mctx, |ui| {
-                            ui.add_space(4.0);
-                            self.render_manage_inner(ui, admin_live);
-                        });
-                        if mctx.input(|i| i.viewport().close_requested()) {
-                            close = true;
-                        }
-                    }
-                    mctx.request_repaint_after(Duration::from_secs(1));
-                },
-            );
-            if close {
-                self.show_manage = false;
-                self.manage_placed = false;
-            }
-        }
         // Hidden windows need no sizing: no content work happens there.
         if !hidden {
             self.fit_window(ctx);

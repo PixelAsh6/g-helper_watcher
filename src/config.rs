@@ -18,6 +18,9 @@ pub struct AppConfig {
     /// 0 disables. Re-evaluation happens automatically after it lapses.
     #[serde(default = "default_cooldown")]
     pub switch_cooldown_secs: u64,
+    /// Pause auto-switching while on battery power.
+    #[serde(default)]
+    pub pause_on_battery: bool,
     /// Pause expiry as unix millis (shared with the dashboard child process).
     #[serde(default)]
     pub paused_until_millis: Option<i64>,
@@ -36,6 +39,10 @@ pub struct AppConfig {
     /// Explicit restart requested (dashboard button). Consumed by the daemon.
     #[serde(default)]
     pub restart_request: bool,
+    /// Reopen the dashboard after the restart lands (restart UAC would
+    /// otherwise eat the window the button was pressed in).
+    #[serde(default)]
+    pub reopen_dashboard: bool,
     /// Last auto-switch time as unix millis (written by daemon; read by
     /// dashboard for the cooldown countdown).
     #[serde(default)]
@@ -54,12 +61,14 @@ impl Default for AppConfig {
             trigger_profile: "Turbo".to_string(),
             pause_minutes: 10,
             switch_cooldown_secs: default_cooldown(),
+            pause_on_battery: false,
             paused_until_millis: None,
             event_source: None,
             run_as_admin: false,
             daemon_elevated: None,
             daemon_build: None,
             restart_request: false,
+            reopen_dashboard: false,
             last_switch_millis: None,
         }
     }
